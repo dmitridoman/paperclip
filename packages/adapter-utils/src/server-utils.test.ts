@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -35,6 +35,7 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
+  terminateSystemdRunScope,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
@@ -568,6 +569,283 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  const systemdUserAvailable =
+    process.platform === "linux" &&
+    spawnSync("systemctl", ["--user", "show-environment"], {
+      stdio: "ignore",
+    }).status === 0;
+
+  it.skipIf(!systemdUserAvailable)(
+    "stops descendants that create their own process group when systemd containment is required",
+    async () => {
+      const previousContainment =
+        process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+      process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";
+      let descendantPid = 0;
+
+      try {
+        const result = await runChildProcess(
+          randomUUID(),
+          process.execPath,
+          [
+            "-e",
+            [
+              "const { spawn } = require('node:child_process');",
+              "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+              "child.unref();",
+              "process.stdout.write(String(child.pid));",
+              "setInterval(() => {}, 1000);",
+            ].join(" "),
+          ],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 1,
+            graceSec: 1,
+            onLog: async () => {},
+          },
+        );
+
+        descendantPid = Number.parseInt(result.stdout.trim(), 10);
+        expect(result.timedOut).toBe(true);
+        expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+        expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+      } finally {
+        if (previousContainment === undefined) {
+          delete process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+        } else {
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = previousContainment;
+        }
+        if (descendantPid > 0 && isPidAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // Ignore cleanup races.
+          }
+        }
+      }
+    },
+  );
+
+  it.skipIf(!systemdUserAvailable)(
+    "does not settle an explicit stop until the contained descendant is gone",
+    async () => {
+      const previousContainment = process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+      process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";
+      const runId = randomUUID();
+      let descendantPid = 0;
+      let observed = "";
+
+      try {
+        const resultPromise = runChildProcess(
+          runId,
+          process.execPath,
+          [
+            "-e",
+            [
+              "const { spawn } = require('node:child_process');",
+              "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+              "child.unref();",
+              "process.stdout.write(`descendant:${child.pid}\\n`);",
+              "setInterval(() => {}, 1000);",
+            ].join(" "),
+          ],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 0,
+            graceSec: 1,
+            onLog: async (_stream, text) => {
+              observed += text;
+            },
+          },
+        );
+        const pidMatch = await waitForTextMatch(
+          () => observed,
+          /descendant:(\d+)/,
+          3_000,
+        );
+        descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
+        const running = runningProcesses.get(runId);
+        expect(running?.containment).toBeTruthy();
+
+        await terminateSystemdRunScope(running!.containment!, {
+          signal: "SIGTERM",
+          graceMs: 1_000,
+        });
+        expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+        await expect(resultPromise).resolves.toMatchObject({
+          signal: "SIGTERM",
+          timedOut: false,
+        });
+      } finally {
+        if (previousContainment === undefined) {
+          delete process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+        } else {
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = previousContainment;
+        }
+        if (descendantPid > 0 && isPidAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // Ignore cleanup races.
+          }
+        }
+      }
+    },
+  );
+
+  it.skipIf(!systemdUserAvailable)(
+    "fences cancellation while the transient scope is still registering",
+    async () => {
+      const previousContainment = process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+      process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";
+      const runId = randomUUID();
+
+      try {
+        const resultPromise = runChildProcess(
+          runId,
+          process.execPath,
+          ["-e", "setInterval(() => {}, 1000)"],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 0,
+            graceSec: 1,
+            onLog: async () => {},
+          },
+        );
+        const deadline = Date.now() + 2_000;
+        let running = runningProcesses.get(runId);
+        while (!running && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          running = runningProcesses.get(runId);
+        }
+        expect(running?.containment).toBeTruthy();
+
+        await terminateSystemdRunScope(running!.containment!, {
+          signal: "SIGTERM",
+          graceMs: 1_000,
+        });
+        await expect(resultPromise).resolves.toMatchObject({
+          signal: "SIGTERM",
+          timedOut: false,
+        });
+      } finally {
+        if (previousContainment === undefined) {
+          delete process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+        } else {
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = previousContainment;
+        }
+      }
+    },
+  );
+
+  it.skipIf(!systemdUserAvailable)(
+    "stops a run scope when its managed Paperclip service stops",
+    async () => {
+      const previousContainment = process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+      const previousParent = process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT;
+      const parentUnit = `paperclip-test-parent-${randomUUID()}.service`;
+      const started = spawnSync(
+        "systemd-run",
+        [
+          "--user",
+          `--unit=${parentUnit.slice(0, -".service".length)}`,
+          "--property=Type=exec",
+          "--quiet",
+          "--",
+          "sleep",
+          "infinity",
+        ],
+        { stdio: "ignore" },
+      );
+      expect(started.status).toBe(0);
+      process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";
+      process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT = parentUnit;
+      let descendantPid = 0;
+      let observed = "";
+
+      try {
+        const resultPromise = runChildProcess(
+          randomUUID(),
+          process.execPath,
+          [
+            "-e",
+            [
+              "const { spawn } = require('node:child_process');",
+              "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+              "child.unref();",
+              "process.stdout.write(`descendant:${child.pid}\\n`);",
+              "setInterval(() => {}, 1000);",
+            ].join(" "),
+          ],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 0,
+            graceSec: 1,
+            onLog: async (_stream, text) => {
+              observed += text;
+            },
+          },
+        );
+        const pidMatch = await waitForTextMatch(
+          () => observed,
+          /descendant:(\d+)/,
+          3_000,
+        );
+        descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
+        if (!Number.isInteger(descendantPid) || descendantPid <= 0) {
+          const earlyResult = await Promise.race([
+            resultPromise.then(
+              (result) => ({ result }),
+              (error: Error) => ({ error: error.message }),
+            ),
+            new Promise<{ pending: true }>((resolve) =>
+              setTimeout(() => resolve({ pending: true }), 25),
+            ),
+          ]);
+          throw new Error(
+            `Contained run did not start: ${JSON.stringify({ observed, earlyResult })}`,
+          );
+        }
+
+        expect(
+          spawnSync("systemctl", ["--user", "stop", parentUnit], {
+            stdio: "ignore",
+          }).status,
+        ).toBe(0);
+        await expect(resultPromise).resolves.toMatchObject({ timedOut: false });
+        expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+      } finally {
+        spawnSync("systemctl", ["--user", "stop", parentUnit], {
+          stdio: "ignore",
+        });
+        spawnSync("systemctl", ["--user", "reset-failed", parentUnit], {
+          stdio: "ignore",
+        });
+        if (previousContainment === undefined) {
+          delete process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+        } else {
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = previousContainment;
+        }
+        if (previousParent === undefined) {
+          delete process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT;
+        } else {
+          process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT = previousParent;
+        }
+        if (descendantPid > 0 && isPidAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // Ignore cleanup races.
+          }
+        }
+      }
+    },
+  );
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
@@ -972,7 +1250,7 @@ describe("renderPaperclipWakePrompt", () => {
     fallbackFetchNeeded: false,
   };
 
-  it("recognizes only normalized, harness-checked-out ordinary external-chat wakes", () => {
+  it("recognizes only normalized, Paperclip-checked-out ordinary external-chat wakes", () => {
     expect(isPaperclipExternalChatTurn(ordinaryExternalChatWake)).toBe(true);
     const normalized = JSON.parse(
       stringifyPaperclipWakePayload(ordinaryExternalChatWake) ?? "{}",
@@ -1621,7 +1899,7 @@ describe("renderPaperclipWakePrompt", () => {
     const newerComment = {
       ...ordinaryExternalChatWake.comments[0],
       id: "comment-2",
-      body: "Also answer this genuinely new follow-up.",
+      body: "Also answer this new follow-up.",
     };
     const wake = {
       ...externalQuestionWake,
@@ -1647,7 +1925,7 @@ describe("renderPaperclipWakePrompt", () => {
       prompt.indexOf("Ask for a color"),
     );
     expect(prompt.indexOf("Ask for a color")).toBeLessThan(
-      prompt.indexOf("Also answer this genuinely new follow-up."),
+      prompt.indexOf("Also answer this new follow-up."),
     );
   });
 
@@ -1745,7 +2023,7 @@ describe("renderPaperclipWakePrompt", () => {
   it.each([
     [
       "process_lost",
-      "Try again — resume from durable progress; don't redo completed steps.",
+      "Try again. Resume from durable progress and do not redo completed steps.",
     ],
     [
       "successful_run_missing_state",
@@ -1822,7 +2100,9 @@ describe("renderPaperclipWakePrompt", () => {
         expect(prompt).toContain(
           "Any comment you post on the source issue must be ≤3 lines",
         );
-        expect(prompt).toContain("No headings, no run-by-run narrative.");
+        expect(prompt).toContain(
+          "Keep it to three lines without headings or a run-by-run narrative.",
+        );
       }
     },
   );
@@ -1849,7 +2129,7 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(prompt).toContain(
-      "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
+      "Do not narrate the recovery in your next comment. Use at most one short sentence and lead with the work.",
     );
   });
 
@@ -1868,7 +2148,7 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(prompt).toContain(
-      "Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
+      "Do not narrate the recovery in your next comment. Use at most one short sentence and lead with the work.",
     );
   });
 
@@ -3716,6 +3996,7 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
 
 describe("appendWithByteCap", () => {
   it("keeps valid UTF-8 when trimming through multibyte text", () => {
+    // copy-ok: the em dash is the multibyte boundary fixture under test.
     const output = appendWithByteCap("prefix ", "hello — world", 7);
 
     expect(output).not.toContain("\uFFFD");

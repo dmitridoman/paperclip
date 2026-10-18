@@ -90,6 +90,13 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  containment?: LocalRunContainment;
+}
+
+export interface LocalRunContainment {
+  kind: "systemd_user_scope";
+  unitName: string;
+  setup?: Promise<void>;
 }
 
 interface SpawnTarget {
@@ -153,6 +160,188 @@ const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
 const SENSITIVE_ENV_KEY =
   /(key|token|secret|password|passwd|authorization|cookie)/i;
 const REDACTED_LOG_VALUE = "***REDACTED***";
+
+const SYSTEMD_REQUIRED_CONTAINMENT = "systemd-required";
+const SYSTEMD_UNIT_COMPONENT_RE = /^[A-Za-z0-9_.:@-]+$/;
+
+export function systemdRunUnitName(runId: string) {
+  const safeRunId = runId.replace(/[^A-Za-z0-9_.-]/g, "-");
+  return `paperclip-run-${safeRunId}.scope`;
+}
+
+function systemdRunTarget(
+  runId: string,
+  target: SpawnTarget,
+): { target: SpawnTarget; containment: LocalRunContainment } {
+  const unitName = systemdRunUnitName(runId);
+  const unitBase = unitName.slice(0, -".scope".length);
+  const parentUnit = process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT?.trim();
+  if (parentUnit && !SYSTEMD_UNIT_COMPONENT_RE.test(parentUnit)) {
+    throw new Error(
+      "PAPERCLIP_SYSTEMD_PARENT_UNIT must be a plain systemd unit name",
+    );
+  }
+  const properties = ["--property=KillMode=control-group"];
+  if (parentUnit) {
+    properties.push(`--property=BindsTo=${parentUnit}`);
+    properties.push(`--property=After=${parentUnit}`);
+  }
+  return {
+    target: {
+      ...target,
+      command: "systemd-run",
+      args: [
+        "--user",
+        "--scope",
+        "--expand-environment=no",
+        `--unit=${unitBase}`,
+        ...properties,
+        "--quiet",
+        "--",
+        target.command,
+        ...target.args,
+      ],
+    },
+    containment: { kind: "systemd_user_scope", unitName },
+  };
+}
+
+function runSystemctl(args: string[]) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn("systemctl", ["--user", ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout = appendWithCap(stdout, String(chunk));
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = appendWithCap(stderr, String(chunk));
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else {
+        const error = new Error(
+          `systemctl ${args[0] ?? "command"} failed (${code ?? "signal"}): ${stderr.trim() || stdout.trim() || "unknown error"}`,
+        ) as Error & { stdout?: string; stderr?: string; exitCode?: number | null };
+        error.stdout = stdout;
+        error.stderr = stderr;
+        error.exitCode = code;
+        reject(error);
+      }
+    });
+  });
+}
+
+async function readSystemdScopeState(
+  unitName: string,
+): Promise<"missing" | "running" | "stopped"> {
+  try {
+    const { stdout } = await runSystemctl([
+      "show",
+      unitName,
+      "--property=LoadState",
+      "--property=ActiveState",
+      "--property=ControlGroup",
+    ]);
+    const values = Object.fromEntries(
+      stdout
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return separator < 0
+            ? [line, ""]
+            : [line.slice(0, separator), line.slice(separator + 1)];
+        }),
+    );
+    if (values.LoadState === "not-found") return "missing";
+    return (
+      (values.ActiveState === "inactive" || values.ActiveState === "failed") &&
+      !values.ControlGroup
+    )
+      ? "stopped"
+      : "running";
+  } catch (error) {
+    const detail = `${(error as { stderr?: string }).stderr ?? ""} ${(error as Error).message}`;
+    if (/not loaded|not found|could not be found|no such unit/i.test(detail)) {
+      return "missing";
+    }
+    throw error;
+  }
+}
+
+async function systemdScopeStopped(unitName: string) {
+  const state = await readSystemdScopeState(unitName);
+  return state === "missing" || state === "stopped";
+}
+
+async function waitForSystemdScopeRegistration(
+  containment: LocalRunContainment,
+  child: ChildProcess,
+) {
+  const deadline = Date.now() + 5_000;
+  do {
+    if ((await readSystemdScopeState(containment.unitName)) !== "missing") return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } while (Date.now() < deadline);
+  throw new Error(
+    `Transient systemd run scope ${containment.unitName} was not registered`,
+  );
+}
+
+async function waitForSystemdScopeStop(unitName: string, timeoutMs: number) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  do {
+    if (await systemdScopeStopped(unitName)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  return systemdScopeStopped(unitName);
+}
+
+export async function terminateSystemdRunScope(
+  containment: LocalRunContainment,
+  options: { signal?: NodeJS.Signals; graceMs?: number } = {},
+) {
+  if (containment.kind !== "systemd_user_scope") return;
+  await containment.setup;
+  if (await systemdScopeStopped(containment.unitName)) return;
+  const signal = options.signal ?? "SIGTERM";
+  try {
+    await runSystemctl([
+      "kill",
+      `--signal=${signal}`,
+      "--kill-whom=all",
+      containment.unitName,
+    ]);
+  } catch (error) {
+    if (await systemdScopeStopped(containment.unitName)) return;
+    throw error;
+  }
+  if (
+    await waitForSystemdScopeStop(
+      containment.unitName,
+      Math.max(100, options.graceMs ?? 2_000),
+    )
+  ) {
+    return;
+  }
+  await runSystemctl([
+    "kill",
+    "--signal=SIGKILL",
+    "--kill-whom=all",
+    containment.unitName,
+  ]);
+  if (await waitForSystemdScopeStop(containment.unitName, 2_000)) return;
+  throw new Error(
+    `Failed to terminate systemd run scope ${containment.unitName}`,
+  );
+}
 
 // PAPERCLIP_* is the reserved runtime namespace: these vars are generated by
 // Paperclip per run (identity, wake, workspace, API access). Adapter/user
@@ -225,8 +414,8 @@ export const WATCHDOG_DEFAULT_MANDATE = [
   "Mandate:",
   "- Treat every terminal, cancelled, blocked, in-review, or otherwise stopped leaf in the watched subtree as a claim that must be verified against comments, documents, work products, screenshots, tests, blockers, and review state.",
   '- Do not accept "I could not" or "waiting for approval" as automatically valid. Read the evidence before deciding.',
-  "- If a stopped leaf is genuinely complete, leave it alone and record why you believe so.",
-  "- If a stopped leaf is not genuinely complete, restore a live path inside the watched subtree by reopening, reassigning, commenting actionable instructions, creating a follow-up child issue, or accepting an eligible task-level interaction (such as a routine plan confirmation when no custom instruction forbids it).",
+  "- If a stopped leaf is actually complete, leave it alone and record why you believe so.",
+  "- If a stopped leaf is not actually complete, restore a live path inside the watched subtree by reopening, reassigning, commenting actionable instructions, creating a follow-up child issue, or accepting an eligible task-level interaction (such as a routine plan confirmation when no custom instruction forbids it).",
   "- If you discover a Paperclip product or platform bug while reviewing the stopped subtree, create a linked engineering follow-up outside the watched source tree using the server-provided watchdog discovery route instead of making it a source child.",
   "- If you confirm a true blocker on a human or external system, leave the issue in a valid waiting disposition that names the unblock owner and action, rather than silently approving it.",
   "",
@@ -2316,7 +2505,7 @@ function renderPaperclipWakePromptBody(
   const recoveryInstruction = (() => {
     switch (recovery?.cause) {
       case "process_lost":
-        return `Your previous run on this issue was lost (${recovery.failureSummary ?? "no failure summary available"}). Try again — resume from durable progress; don't redo completed steps. Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.`;
+        return `Your previous run on this issue was lost (${recovery.failureSummary ?? "no failure summary available"}). Try again. Resume from durable progress and do not redo completed steps. Do not narrate the recovery in your next comment. Use at most one short sentence and lead with the work.`;
       case "successful_run_missing_state":
       case "successful_run_missing_issue_disposition":
         return "Your run completed but left no final disposition. Post a comment summarizing the state and set the correct disposition (`done` / `in_review` / `blocked` / `in_progress` with a live path). Do not start new work.";
@@ -2387,18 +2576,18 @@ function renderPaperclipWakePromptBody(
           : [
               "For a self-contained text request, answer directly from the supplied task and wake context. Make zero Paperclip API calls: do not refetch the issue, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
             ]),
-        "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
+        "Paperclip owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
         "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and any actionable file-access or delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
         "In a normal successful answer, omit routine file-preparation, unconfirmed-delivery, and waiting-for-next-message status; end after the requested content or a neutral file label. Report a genuine failure or required user action plainly, without claiming a delivery that has not been confirmed.",
         ...(externalChatQuestionResponseTurn
           ? [
-              "Use the authoritative answer below to complete the original request; do not repeat or re-ask the resolved question. Preserve the original request's exact-output constraints literally. Put the requested result, including the chosen value, in the semantic completion summary—not an acknowledgment that the answer was received or that the task was updated.",
+              "Use the authoritative answer below to complete the original request; do not repeat or re-ask the resolved question. Preserve the original request's exact-output constraints literally. Put the requested result, including the chosen value, in the semantic completion summary, not an acknowledgment that the answer was received or that the task was updated.",
               "This answer resolves only the named question, not a separate approval or completion review. Report the work disposition truthfully in the semantic control fields; do not change task status, clear a review, or manufacture a new wait or monitor to force a reply. Paperclip independently preserves genuine pending review gates.",
             ]
           : []),
         "If the user explicitly asks to keep this current chat task open and wait for their next provider message without scheduling more work, report `yielded` with continuation kind `response_wake`; do not report `done`. Use that wait only after completing this turn's requested response, and never use it to defer unfinished work or for an ordinary completed request. Paperclip independently verifies the current chat binding before preserving the task.",
         `File-delivery contract: ${paperclipChatFilePreparationDelivery(normalized.externalChatProvider).guidance}`,
-        "When the request genuinely requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
+        "When the request requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
         "Keep the final response concise and provider-facing. Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping. Keep wait and review dispositions in the semantic control fields rather than appending status boilerplate to the answer. Mention task state only when the user asks about it or must act on a real blocker.",
         "",
       ]
@@ -2410,7 +2599,7 @@ function renderPaperclipWakePromptBody(
           recovery?.cause === "successful_run_missing_issue_disposition"
             ? []
             : [
-                "Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). No headings, no run-by-run narrative.",
+                "Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). Keep it to three lines without headings or a run-by-run narrative.",
               ]),
           `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
           "",
@@ -2440,7 +2629,7 @@ function renderPaperclipWakePromptBody(
       : []),
     ...(normalized.reason === "issue_recovery_action_restored"
       ? [
-          "- instruction: Do not narrate the recovery in your next comment — at most one short sentence; lead with the work.",
+          "- instruction: Do not narrate the recovery in your next comment. Use at most one short sentence and lead with the work.",
         ]
       : []),
   ];
@@ -2627,7 +2816,7 @@ function renderPaperclipWakePromptBody(
     }
   }
   if (normalized.checkedOutByHarness && !externalChatContract) {
-    lines.push("- checkout: already claimed by the harness for this run");
+    lines.push("- checkout: already claimed by Paperclip for this run");
   }
   if (!resumedSession && normalized.executionWorkspace?.branchName) {
     lines.push(
@@ -2636,7 +2825,7 @@ function renderPaperclipWakePromptBody(
   }
   if (normalized.simplifiedEnglishInteractions) {
     lines.push(
-      "- interaction language (experimental): write every user interaction you post (request_confirmation, ask_user_questions, suggest_tasks, checkbox prompts and options, and any other content rendered inside an interaction block) in ASD-STE100 Simplified Technical English. In each interaction, briefly tell the user what information they need to make the decision and what happens for each choice. This applies only to interaction content — write your thinking, comments, documents, and other responses in your usual style.",
+      "- interaction language (experimental): write every user interaction you post (request_confirmation, ask_user_questions, suggest_tasks, checkbox prompts and options, and any other content rendered inside an interaction block) in ASD-STE100 Simplified Technical English. In each interaction, briefly tell the user what information they need to make the decision and what happens for each choice. This applies only to interaction content. Write your thinking, comments, documents, and other responses in your usual style.",
     );
   }
   if (normalized.dependencyBlockedInteraction) {
@@ -3062,7 +3251,7 @@ function renderPaperclipWakePromptBody(
   if (normalized.checkedOutByHarness && !externalChatContract) {
     lines.push(
       "",
-      "The harness already checked out this issue for the current run.",
+      "Paperclip already checked out this issue for the current run.",
       "Do not call `POST /api/issues/$PAPERCLIP_TASK_ID/checkout` again unless you intentionally switch to a different task.",
       "",
     );
@@ -4713,7 +4902,26 @@ export async function runChildProcess(
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
-      .then((target) => {
+      .then((resolvedTarget) => {
+        const useSystemdContainment =
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT ===
+            SYSTEMD_REQUIRED_CONTAINMENT &&
+          process.platform === "linux" &&
+          !opts.remoteExecution;
+        if (
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT ===
+            SYSTEMD_REQUIRED_CONTAINMENT &&
+          process.platform !== "linux" &&
+          !opts.remoteExecution
+        ) {
+          throw new Error(
+            "PAPERCLIP_LOCAL_RUN_CONTAINMENT=systemd-required is supported only on Linux",
+          );
+        }
+        const contained = useSystemdContainment
+          ? systemdRunTarget(runId, resolvedTarget)
+          : { target: resolvedTarget, containment: undefined };
+        const target = contained.target;
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -4727,11 +4935,19 @@ export async function runChildProcess(
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
+        if (contained.containment) {
+          contained.containment.setup = waitForSystemdScopeRegistration(
+            contained.containment,
+            child,
+          );
+        }
 
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts
-                .onSpawn({ pid: child.pid, processGroupId, startedAt })
+            ? Promise.resolve(contained.containment?.setup)
+                .then(() =>
+                  opts.onSpawn!({ pid: child.pid!, processGroupId, startedAt }),
+                )
                 .catch((err) => {
                   onLogError(
                     err,
@@ -4745,6 +4961,7 @@ export async function runChildProcess(
           child,
           graceSec: opts.graceSec,
           processGroupId,
+          containment: contained.containment,
         });
 
         let timedOut = false;
@@ -4765,6 +4982,20 @@ export async function runChildProcess(
           if (terminalCleanupKillTimer) clearTimeout(terminalCleanupKillTimer);
           terminalCleanupTimer = null;
           terminalCleanupKillTimer = null;
+        };
+
+        const stopOwnedProcess = (
+          signal: NodeJS.Signals,
+          graceMs = Math.max(1, opts.graceSec) * 1000,
+        ) => {
+          if (contained.containment) {
+            return terminateSystemdRunScope(contained.containment, {
+              signal,
+              graceMs,
+            });
+          }
+          signalRunningProcess({ child, processGroupId }, signal);
+          return Promise.resolve();
         };
 
         const maybeArmTerminalResultCleanup = () => {
@@ -4812,16 +5043,26 @@ export async function runChildProcess(
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
-            terminalCleanupKillTimer = setTimeout(
-              () => {
-                terminalCleanupKillTimer = null;
-                terminalCleanupSignal = "SIGKILL";
-                terminalCleanupForceKilled = true;
-                signalRunningProcess({ child, processGroupId }, "SIGKILL");
-              },
-              Math.max(1, opts.graceSec) * 1000,
-            );
+            if (contained.containment) {
+              void stopOwnedProcess("SIGTERM").catch((err) =>
+                onLogError(
+                  err,
+                  runId,
+                  "failed to stop contained process after terminal result",
+                ),
+              );
+            } else {
+              signalRunningProcess({ child, processGroupId }, "SIGTERM");
+              terminalCleanupKillTimer = setTimeout(
+                () => {
+                  terminalCleanupKillTimer = null;
+                  terminalCleanupSignal = "SIGKILL";
+                  terminalCleanupForceKilled = true;
+                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                },
+                Math.max(1, opts.graceSec) * 1000,
+              );
+            }
           }, graceMs);
         };
 
@@ -4830,13 +5071,26 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(
-                  () => {
-                    signalRunningProcess({ child, processGroupId }, "SIGKILL");
-                  },
-                  Math.max(1, opts.graceSec) * 1000,
-                );
+                if (contained.containment) {
+                  void stopOwnedProcess("SIGTERM").catch((err) =>
+                    onLogError(
+                      err,
+                      runId,
+                      "failed to stop contained process after timeout",
+                    ),
+                  );
+                } else {
+                  signalRunningProcess({ child, processGroupId }, "SIGTERM");
+                  setTimeout(
+                    () => {
+                      signalRunningProcess(
+                        { child, processGroupId },
+                        "SIGKILL",
+                      );
+                    },
+                    Math.max(1, opts.graceSec) * 1000,
+                  );
+                }
               }, opts.timeoutSec * 1000)
             : null;
 

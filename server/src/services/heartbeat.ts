@@ -312,6 +312,8 @@ import {
   asNumber,
   appendWithByteCap,
   MAX_EXCERPT_BYTES,
+  terminateSystemdRunScope,
+  type LocalRunContainment,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import {
@@ -9051,9 +9053,17 @@ export async function persistHeartbeatRunProcessMetadata(
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
+  containment?: LocalRunContainment;
   graceMs?: number;
   signal?: NodeJS.Signals;
 }) {
+  if (input.containment) {
+    await terminateSystemdRunScope(input.containment, {
+      graceMs: input.graceMs,
+      signal: input.signal,
+    });
+    return;
+  }
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
   if (typeof pid !== "number" && typeof processGroupId !== "number") return;
@@ -15330,6 +15340,7 @@ export function heartbeatService(
           await terminateHeartbeatRunProcess({
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            containment: running.containment,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
@@ -29753,6 +29764,7 @@ export function heartbeatService(
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
+                containment: running.containment,
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
                 signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
@@ -29943,6 +29955,17 @@ export function heartbeatService(
             runtimeMode: run.runtimeMode,
           });
         }
+        const running = runningProcesses.get(run.id);
+        if (running) {
+          await terminateHeartbeatRunProcess({
+            pid: running.child.pid,
+            processGroupId: running.processGroupId,
+            containment: running.containment,
+            graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        }
+        runningProcesses.delete(run.id);
+
         const persistedCancellationResult =
           run.runtimeMode === "native"
             ? await getRun(run.id).then((current) =>
@@ -29967,15 +29990,6 @@ export function heartbeatService(
           error: reason,
         });
 
-        const running = runningProcesses.get(run.id);
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid,
-            processGroupId: running.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        }
-        runningProcesses.delete(run.id);
         await releaseIssueExecutionAndPromote(run);
       } finally {
         stopOwnership?.release();
