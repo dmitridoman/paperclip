@@ -4,10 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, Globe, Paperclip, Plug, Terminal } from "lucide-react";
 import { publicMcpApi } from "@/api/publicMcp";
 import { ApiError } from "@/api/client";
+import { useAccountIdentity } from "@/api/companies-query";
+import { healthApi } from "@/api/health";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { Link } from "@/lib/router";
 import { copyTextToClipboard } from "@/lib/clipboard";
+import { queryKeys } from "@/lib/queryKeys";
 import { AgentSetupPrompt } from "@/components/AgentSetupPrompt";
 import { OpenCodeLogoIcon } from "@/components/OpenCodeLogoIcon";
 import { CompanyPatternIcon } from "@/components/CompanyPatternIcon";
@@ -19,6 +22,21 @@ const connectionsKey = ["mcp-connections"];
 type Assistant = AssistantClient;
 const assistants = assistantClientNames;
 
+function useAssistantConnectionAvailability() {
+  const { userId, settled: identitySettled } = useAccountIdentity();
+  const { data: health } = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: healthApi.get,
+    staleTime: 60_000,
+  });
+  return {
+    available: identitySettled && Boolean(userId) && health?.deploymentMode === "authenticated",
+    identitySettled,
+    userId,
+    deploymentMode: health?.deploymentMode,
+  };
+}
+
 function AssistantIcon({ assistant }: { assistant: Assistant }) {
   if (assistant === "codex" || assistant === "claude") return <img src={`/brands/${assistant}-color.svg`} alt="" className="size-4 shrink-0" />;
   if (assistant === "opencode") return <span aria-hidden="true" className="inline-flex shrink-0"><OpenCodeLogoIcon className="size-4" /></span>;
@@ -28,16 +46,22 @@ function AssistantIcon({ assistant }: { assistant: Assistant }) {
 
 export function useAssistantConnections(poll = false) {
   const { selectedCompanyId } = useCompany();
+  const availability = useAssistantConnectionAvailability();
   const query = useQuery({
     queryKey: connectionsKey, queryFn: publicMcpApi.connections, retry: false,
-    enabled: Boolean(selectedCompanyId), refetchInterval: poll ? 5000 : false,
+    enabled: Boolean(selectedCompanyId && availability.available), refetchInterval: poll ? 5000 : false,
   });
-  return { ...query, rows: (query.data ?? []).filter(row => row.companyId === selectedCompanyId) };
+  return {
+    ...query,
+    available: availability.available,
+    rows: (query.data ?? []).filter(row => row.companyId === selectedCompanyId),
+  };
 }
 
 /** Inbound assistant access belongs beside the existing outbound connectors. */
 export function AssistantConnectionCard({ onNavigate }: { onNavigate: (href: string) => void }) {
   const connections = useAssistantConnections();
+  if (!connections.available) return null;
   const active = connections.rows.filter(row => !row.revokedAt);
   const action = !connections.isSuccess ? "Open" : active.length ? "Manage" : "Set up";
   return <div role="listitem" data-app-slug="assistant-connection" data-connected={connections.isSuccess ? String(active.length > 0) : undefined} className="overflow-hidden rounded-xl border border-border">
@@ -87,10 +111,14 @@ function setupError(error: Error): string {
 
 export function AssistantConnection({ initialAssistant = "codex" }: { initialAssistant?: Assistant } = {}) {
   const { selectedCompany, selectedCompanyId } = useCompany();
+  const availability = useAssistantConnectionAvailability();
   const { setBreadcrumbs } = useBreadcrumbs();
   const client = useQueryClient();
   const [assistant, setAssistant] = useState<Assistant>(initialAssistant);
-  const setup = useQuery({ queryKey: ["mcp-setup"], queryFn: publicMcpApi.setup, retry: false, refetchOnWindowFocus: "always", refetchOnMount: "always" });
+  const setup = useQuery({
+    queryKey: ["mcp-setup"], queryFn: publicMcpApi.setup, retry: false,
+    enabled: availability.available, refetchOnWindowFocus: "always", refetchOnMount: "always",
+  });
   const connections = useAssistantConnections(setup.data?.enabled === true);
   const revoke = useMutation({ mutationFn: publicMcpApi.revoke, onSuccess: () => client.invalidateQueries({ queryKey: connectionsKey }) });
   useEffect(() => {
@@ -98,6 +126,9 @@ export function AssistantConnection({ initialAssistant = "codex" }: { initialAss
     return () => setBreadcrumbs([]);
   }, [setBreadcrumbs]);
   if (!selectedCompanyId || !selectedCompany) return <p className="text-sm text-muted-foreground">Select an organization to connect an assistant.</p>;
+  if (availability.identitySettled && (!availability.userId || availability.deploymentMode === "local_trusted")) {
+    return <p className="text-sm text-muted-foreground">Assistant connections require an authenticated Paperclip user account.</p>;
+  }
   const serverUrl = setup.data?.serverUrl ?? "";
   const invitation = serverUrl ? mcpInvitation(serverUrl, { id: selectedCompanyId, name: selectedCompany.name }) : "";
   return <div className="max-w-3xl space-y-6 pb-8">
@@ -138,7 +169,7 @@ export function AssistantConnection({ initialAssistant = "codex" }: { initialAss
       <h2 id="connected-assistants" className="text-sm font-semibold">Your connected assistants</h2>
       {connections.isPending && <p className="text-sm text-muted-foreground">Loading connections…</p>}
       {(connections.error || revoke.error) && <p role="alert" className="text-sm text-destructive">{revoke.error ? "Couldn’t revoke this connection. Try again." : "Couldn’t load your connections. Try again."} <button type="button" className="underline" onClick={() => void connections.refetch()}>Refresh</button></p>}
-      {connections.isSuccess && connections.rows.length === 0 && <p className="text-sm text-muted-foreground">No assistants connected to {selectedCompany.name} yet.</p>}
+      {connections.isSuccess && connections.rows.length === 0 && <p className="text-sm text-muted-foreground">You haven’t connected any assistants to {selectedCompany.name} yet.</p>}
       <div className="divide-y divide-border">{connections.rows.map(row => <div key={row.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
         <div className="space-y-1"><p className="text-sm font-medium">{row.clientName}</p><p className="text-xs text-muted-foreground">{row.revokedAt ? "Revoked" : `Connected as you · ${row.scopes.includes("paperclip:write") ? "Read and write" : "Read only"}`}</p></div>
         {!row.revokedAt && <Button variant="outline" size="sm" disabled={revoke.isPending} onClick={() => revoke.mutate(row.id)} aria-label={`Revoke ${row.clientName} connection`}>Revoke</Button>}

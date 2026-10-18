@@ -4,10 +4,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AssistantConnection, AssistantConnectionCard } from "./AssistantConnection";
-const mocks = vi.hoisted(() => ({ setup: vi.fn(), connections: vi.fn(), revoke: vi.fn(), breadcrumbs: vi.fn(), copy: vi.fn() }));
+import { queryKeys } from "@/lib/queryKeys";
+const mocks = vi.hoisted(() => ({ setup: vi.fn(), connections: vi.fn(), revoke: vi.fn(), breadcrumbs: vi.fn(), copy: vi.fn(), identity: vi.fn() }));
 vi.mock("@/hooks/usePrefersReducedMotion", () => ({ usePrefersReducedMotion: () => true }));
 vi.mock("@/lib/clipboard", () => ({ copyTextToClipboard: mocks.copy }));
 vi.mock("@/api/publicMcp", () => ({ publicMcpApi: mocks }));
+vi.mock("@/api/companies-query", () => ({ useAccountIdentity: mocks.identity }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "butter", selectedCompany: { id: "butter", name: "Butter", logoUrl: null } }) }));
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: mocks.breadcrumbs }) }));
 vi.mock("@/lib/router", () => ({ Link: ({ children, to, ...props }: { children: React.ReactNode; to: string }) => <a href={to} {...props}>{children}</a> }));
@@ -20,14 +22,22 @@ async function render(element: React.ReactNode = <AssistantConnection initialAss
   await flush();
 }
 beforeEach(() => {
+  mocks.identity.mockReturnValue({ userId: "user-1", settled: true, failed: false });
   mocks.setup.mockResolvedValue({ enabled: true, serverUrl: "https://canonical.example/mcp/paperclip" });
   mocks.connections.mockResolvedValue([]);
   mocks.revoke.mockResolvedValue(undefined);
   client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  client.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "authenticated" });
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
 });
 afterEach(async () => { await act(async () => root.unmount()); client.clear(); container.remove(); vi.clearAllMocks(); });
 describe("assistant setup from Connections", () => {
+  it("does not request authenticated assistant connections in local-trusted mode", async () => {
+    client.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "local_trusted" });
+    await render(<AssistantConnectionCard onNavigate={vi.fn()} />);
+    expect(mocks.connections).not.toHaveBeenCalled();
+    expect(container.textContent).toBe("");
+  });
   it("copies a scoped instruction link with no credential and keeps manual configuration collapsed", async () => {
     await render();
     expect(container.querySelector("details")?.open).toBe(false);
@@ -56,7 +66,7 @@ describe("assistant setup from Connections", () => {
     const config = Array.from(container.querySelectorAll("pre")).map(p => p.textContent!).find(p => p.startsWith("{"))!;
     expect(JSON.parse(config).mcp.paperclip).toEqual({ type: "remote", url: "https://canonical.example/mcp/paperclip", enabled: true, oauth: { scope: "paperclip:read paperclip:write offline_access" } });
     expect(container.textContent).toContain("opencode mcp auth paperclip");
-    expect(container.textContent).toContain("No assistants connected to Butter yet");
+    expect(container.textContent).toContain("You haven’t connected any assistants to Butter yet");
     expect(container.querySelector('[role="combobox"]')).toBeNull();
     expect(mocks.revoke).not.toHaveBeenCalled();
   });
