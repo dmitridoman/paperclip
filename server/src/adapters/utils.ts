@@ -24,6 +24,8 @@ export const runningProcesses: Map<string, {
 }> =
   serverUtils.runningProcesses;
 export const terminateSystemdRunScope = serverUtils.terminateSystemdRunScope;
+export const markLocalRunCancellationRequested =
+  serverUtils.markLocalRunCancellationRequested;
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;

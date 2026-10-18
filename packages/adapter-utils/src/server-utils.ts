@@ -163,6 +163,22 @@ const REDACTED_LOG_VALUE = "***REDACTED***";
 
 const SYSTEMD_REQUIRED_CONTAINMENT = "systemd-required";
 const SYSTEMD_UNIT_COMPONENT_RE = /^[A-Za-z0-9_.:@-]+$/;
+const LOCAL_RUN_CANCELLATION_RETENTION_MS = 10 * 60 * 1000;
+const localRunCancellationRequests = new Map<string, NodeJS.Timeout>();
+
+export function markLocalRunCancellationRequested(runId: string) {
+  const previous = localRunCancellationRequests.get(runId);
+  if (previous) clearTimeout(previous);
+  const expiry = setTimeout(() => {
+    localRunCancellationRequests.delete(runId);
+  }, LOCAL_RUN_CANCELLATION_RETENTION_MS);
+  expiry.unref?.();
+  localRunCancellationRequests.set(runId, expiry);
+}
+
+function localRunCancellationRequested(runId: string) {
+  return localRunCancellationRequests.has(runId);
+}
 
 export function systemdRunUnitName(runId: string) {
   const safeRunId = runId.replace(/[^A-Za-z0-9_.-]/g, "-");
@@ -4913,6 +4929,9 @@ export async function runChildProcess(
             SYSTEMD_REQUIRED_CONTAINMENT &&
           process.platform === "linux" &&
           !opts.remoteExecution;
+        if (useSystemdContainment && localRunCancellationRequested(runId)) {
+          throw new Error("Run stopped before provider startup");
+        }
         if (
           process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT ===
             SYSTEMD_REQUIRED_CONTAINMENT &&
@@ -4947,20 +4966,29 @@ export async function runChildProcess(
           );
         }
 
-        const spawnPersistPromise =
-          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? Promise.resolve(contained.containment?.setup)
-                .then(() =>
-                  opts.onSpawn!({ pid: child.pid!, processGroupId, startedAt }),
-                )
-                .catch((err) => {
-                  onLogError(
-                    err,
-                    runId,
-                    "failed to record child process metadata",
-                  );
-                })
-            : Promise.resolve();
+        const spawnPersistPromise = Promise.resolve(contained.containment?.setup)
+          .then(async () => {
+            if (
+              contained.containment &&
+              localRunCancellationRequested(runId)
+            ) {
+              await terminateSystemdRunScope(contained.containment, {
+                signal: "SIGTERM",
+                graceMs: Math.max(1, opts.graceSec) * 1000,
+              });
+              return;
+            }
+            if (typeof child.pid === "number" && child.pid > 0 && opts.onSpawn) {
+              await opts.onSpawn({ pid: child.pid, processGroupId, startedAt });
+            }
+          })
+          .catch((err) => {
+            onLogError(
+              err,
+              runId,
+              "failed to record child process metadata",
+            );
+          });
 
         runningProcesses.set(runId, {
           child,

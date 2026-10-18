@@ -20,6 +20,7 @@ import {
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
+  markLocalRunCancellationRequested,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
@@ -577,6 +578,47 @@ describe("runChildProcess", () => {
     }).status === 0;
 
   it.skipIf(!systemdUserAvailable)(
+    "does not start a provider after cancellation wins during setup",
+    async () => {
+      const previousContainment = process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+      process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";
+      const runId = randomUUID();
+      markLocalRunCancellationRequested(runId);
+
+      try {
+        await expect(
+          runChildProcess(
+            runId,
+            process.execPath,
+            ["-e", "process.stdout.write('provider-started')"],
+            {
+              cwd: process.cwd(),
+              env: {},
+              timeoutSec: 0,
+              graceSec: 1,
+              onLog: async () => {},
+            },
+          ),
+        ).rejects.toThrow("Run stopped before provider startup");
+        expect(runningProcesses.has(runId)).toBe(false);
+        expect(
+          spawnSync(
+            "systemctl",
+            ["--user", "show", systemdRunUnitName(runId), "--property=LoadState", "--value"],
+            { encoding: "utf8" },
+          ).stdout.trim(),
+        ).toBe("not-found");
+      } finally {
+        if (previousContainment === undefined) {
+          delete process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
+        } else {
+          process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = previousContainment;
+        }
+      }
+    },
+  );
+
+  it.skipIf(!systemdUserAvailable)(
     "stops descendants that create their own process group when systemd containment is required",
     async () => {
       const previousContainment =
@@ -698,7 +740,7 @@ describe("runChildProcess", () => {
   );
 
   it.skipIf(!systemdUserAvailable)(
-    "fences cancellation while the transient scope is still registering",
+    "stops a transient scope while it is still registering",
     async () => {
       const previousContainment = process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT;
       process.env.PAPERCLIP_LOCAL_RUN_CONTAINMENT = "systemd-required";

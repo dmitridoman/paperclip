@@ -312,6 +312,7 @@ import {
   asNumber,
   appendWithByteCap,
   MAX_EXCERPT_BYTES,
+  markLocalRunCancellationRequested,
   terminateSystemdRunScope,
   type LocalRunContainment,
 } from "../adapters/utils.js";
@@ -29657,6 +29658,7 @@ export function heartbeatService(
         throw pendingProcessCancellation.error;
       return getRun(run.id);
     }
+    markLocalRunCancellationRequested(run.id);
     const running = runningProcesses.get(run.id);
     const stopOwnership =
       run.runtimeMode !== "native"
