@@ -35,6 +35,7 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
+  systemdRunUnitName,
   terminateSystemdRunScope,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -591,7 +592,8 @@ describe("runChildProcess", () => {
             "-e",
             [
               "const { spawn } = require('node:child_process');",
-              "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+              "process.on('SIGTERM', () => {});",
+              "const child = spawn(process.execPath, ['-e', 'process.on(\\\"SIGTERM\\\", () => {}); setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
               "child.unref();",
               "process.stdout.write(String(child.pid));",
               "setInterval(() => {}, 1000);",
@@ -765,10 +767,11 @@ describe("runChildProcess", () => {
       process.env.PAPERCLIP_SYSTEMD_PARENT_UNIT = parentUnit;
       let descendantPid = 0;
       let observed = "";
+      const runId = randomUUID();
 
       try {
         const resultPromise = runChildProcess(
-          randomUUID(),
+          runId,
           process.execPath,
           [
             "-e",
@@ -812,11 +815,27 @@ describe("runChildProcess", () => {
         }
 
         expect(
+          spawnSync(
+            "systemctl",
+            [
+              "--user",
+              "show",
+              systemdRunUnitName(runId),
+              "--property=TimeoutStopUSec",
+              "--value",
+            ],
+            { encoding: "utf8" },
+          ).stdout.trim(),
+        ).toBe("1s");
+
+        const stoppedAt = Date.now();
+        expect(
           spawnSync("systemctl", ["--user", "stop", parentUnit], {
             stdio: "ignore",
           }).status,
         ).toBe(0);
         await expect(resultPromise).resolves.toMatchObject({ timedOut: false });
+        expect(Date.now() - stoppedAt).toBeLessThan(3_000);
         expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
       } finally {
         spawnSync("systemctl", ["--user", "stop", parentUnit], {

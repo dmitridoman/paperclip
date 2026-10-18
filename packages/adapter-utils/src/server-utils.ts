@@ -172,6 +172,7 @@ export function systemdRunUnitName(runId: string) {
 function systemdRunTarget(
   runId: string,
   target: SpawnTarget,
+  graceSec: number,
 ): { target: SpawnTarget; containment: LocalRunContainment } {
   const unitName = systemdRunUnitName(runId);
   const unitBase = unitName.slice(0, -".scope".length);
@@ -181,7 +182,11 @@ function systemdRunTarget(
       "PAPERCLIP_SYSTEMD_PARENT_UNIT must be a plain systemd unit name",
     );
   }
-  const properties = ["--property=KillMode=control-group"];
+  const scopeStopSec = Math.max(1, Math.ceil(graceSec));
+  const properties = [
+    "--property=KillMode=control-group",
+    `--property=TimeoutStopSec=${scopeStopSec}s`,
+  ];
   if (parentUnit) {
     properties.push(`--property=BindsTo=${parentUnit}`);
     properties.push(`--property=After=${parentUnit}`);
@@ -4919,7 +4924,7 @@ export async function runChildProcess(
           );
         }
         const contained = useSystemdContainment
-          ? systemdRunTarget(runId, resolvedTarget)
+          ? systemdRunTarget(runId, resolvedTarget, opts.graceSec)
           : { target: resolvedTarget, containment: undefined };
         const target = contained.target;
         const childEnv = { ...mergedEnv, ...target.env };
